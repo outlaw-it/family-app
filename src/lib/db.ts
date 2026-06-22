@@ -95,6 +95,21 @@ const SCHEMA: string[] = [
      model     TEXT NOT NULL DEFAULT 'llama3.1',
      base_url  TEXT NOT NULL DEFAULT 'http://localhost:11434/v1'
    )`,
+  // Security: Supabase auto-exposes the `public` schema through its REST "Data API"
+  // (PostgREST), reachable with the public anon key. Enabling RLS — with NO policies —
+  // default-denies the anon + authenticated roles, slamming that side-door shut so the
+  // only way into the data is this app's privileged pooler connection. That connection
+  // is the table OWNER, and owners bypass RLS, so the app is unaffected (privacy is also
+  // still enforced in app code — see memories.ts). Idempotent, so it's safe on every
+  // migrate. Do NOT add FORCE ROW LEVEL SECURITY: that would subject the owner connection
+  // to RLS too and break the app.
+  `ALTER TABLE members       ENABLE ROW LEVEL SECURITY`,
+  `ALTER TABLE spaces        ENABLE ROW LEVEL SECURITY`,
+  `ALTER TABLE memories      ENABLE ROW LEVEL SECURITY`,
+  `ALTER TABLE personas      ENABLE ROW LEVEL SECURITY`,
+  `ALTER TABLE conversations ENABLE ROW LEVEL SECURITY`,
+  `ALTER TABLE messages      ENABLE ROW LEVEL SECURITY`,
+  `ALTER TABLE settings      ENABLE ROW LEVEL SECURITY`,
 ];
 
 async function migrate(sql: Sql): Promise<void> {

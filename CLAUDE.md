@@ -142,6 +142,12 @@ transparent — only add embeddings if it's trivial and asked for.
   `sql` it hands you for every statement that must commit together.
 - **`prepare:false` is load-bearing** — the Supabase transaction pooler rejects named
   prepared statements. Don't remove it.
+- **RLS is enabled on every table** (in the `db.ts` schema migration) to slam shut
+  Supabase's PostgREST "Data API" side-door (anon key). There are **no policies** — the
+  app connects as the table OWNER, which bypasses RLS, so this is invisible to the app;
+  privacy is still enforced in app code. **Don't add `FORCE ROW LEVEL SECURITY`** and
+  **don't switch the app to a non-owner DB role** — either would subject the app to RLS
+  and break it (you'd then need real policies).
 - **Secrets:** `.env` locally (git-ignored), Cloudflare secrets in prod. Never hardcode
   keys or commit them. `.env.example` holds placeholders only. If a key is exposed, tell
   the user to rotate it.
