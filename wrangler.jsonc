@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "family-brain",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2025-03-25",
+  // nodejs_compat is REQUIRED: it's what lets the postgres.js driver (and Next's
+  // Node-style APIs) run on the Worker runtime.
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+  "observability": {
+    "enabled": true
+  }
+  // DATABASE_URL and the model-provider API keys are set as SECRETS, not here:
+  //   wrangler secret put DATABASE_URL
+  //   wrangler secret put ANTHROPIC_API_KEY      (and OPENAI_API_KEY, AZURE_* as needed)
+  // Locally they come from .env / .dev.vars instead.
+}

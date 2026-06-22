@@ -1,0 +1,25 @@
+# dependencies
+/node_modules
+
+# next.js
+/.next
+/out
+
+# cloudflare / opennext build output + local bindings
+/.open-next
+/.wrangler
+.dev.vars
+cloudflare-env.d.ts
+
+# secrets — never commit
+.env
+.env.local
+
+# misc
+*.log
+.DS_Store
+next-env.d.ts
+tsconfig.tsbuildinfo
+
+# retired local SQLite db (app now uses Supabase Postgres)
+/data
