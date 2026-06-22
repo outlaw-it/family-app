@@ -39,3 +39,21 @@ export interface Settings {
 }
 
 export type SpaceScope = "family" | "personal";
+
+// --- conversation history (shared between server + client) ---
+export interface ConversationListItem {
+  id: number;
+  created_at: string;
+  persona_id: number | null;
+  persona_name: string | null;
+  space_type: "family" | "personal" | null;
+  title: string; // first user message, or "New chat"
+}
+
+export interface ConversationMessage {
+  id: number;
+  role: "system" | "user" | "assistant";
+  content: string;
+  model_used: string | null;
+  created_at: string;
+}

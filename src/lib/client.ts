@@ -8,6 +8,11 @@ export function setClientMember(id: number) {
   currentMemberId = id;
 }
 
+/** The current member id, for callers that build their own fetch (e.g. SSE streams). */
+export function getClientMember(): number {
+  return currentMemberId;
+}
+
 export async function api<T = any>(path: string, options: RequestInit = {}): Promise<T> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",

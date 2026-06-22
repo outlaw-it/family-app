@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { db, tx } from "@/lib/db";
 import { currentMemberId } from "@/lib/current";
 import { searchMemories, createMemory, resolveSpaceId } from "@/lib/memories";
-import { chat, keyForProvider, ProviderError } from "@/lib/providers";
+import { streamChat, keyForProvider, ProviderError } from "@/lib/providers";
 import type { ChatMessage } from "@/lib/providers";
 import type { Memory, Persona, Settings, SpaceScope } from "@/lib/types";
 
@@ -27,6 +27,11 @@ function parseRememberCommand(message: string): string | null {
 function titleFromNote(note: string): string {
   const firstLine = note.split(/[.\n]/)[0].trim();
   return (firstLine.length > 70 ? firstLine.slice(0, 67) + "…" : firstLine) || "Note";
+}
+
+// Format one Server-Sent Event frame.
+function sse(event: string, data: unknown): Uint8Array {
+  return new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
 export async function POST(req: Request) {
@@ -82,54 +87,73 @@ export async function POST(req: Request) {
     system += `\n\nNOTE: You have just saved a new memory titled "${savedMemory.title}" into ${spaceLabel}. Confirm to the user that you've remembered it.`;
   }
 
-  // 4) Call the model through the single provider abstraction.
+  // 4) Assemble the model input.
   const history = Array.isArray(body.history) ? body.history.slice(-10) : [];
   const messages: ChatMessage[] = [...history, { role: "user", content: message }];
 
-  let reply: string;
-  try {
-    reply = await chat({
-      provider: settings.provider,
-      model: settings.model,
-      baseUrl: settings.base_url,
-      apiKey: keyForProvider(settings.provider),
-      system,
-      messages,
-    });
-  } catch (e) {
-    const err = e as ProviderError;
-    return NextResponse.json(
-      { error: err.message ?? "Model call failed", provider: settings.provider },
-      { status: err.status ?? 500 }
-    );
-  }
-
-  // 5) Persist the conversation + messages.
   const existingConversationId = body.conversationId ?? null;
   // resolveSpaceId is read outside the tx (separate pooled query) — fine.
   const spaceId = existingConversationId ? null : await resolveSpaceId(memberId, scope);
-  const modelUsed = `${settings.provider}:${settings.model}`;
-  const conversationId = await tx(async (sql) => {
-    let cid = existingConversationId;
-    if (!cid) {
-      const [c] = await sql<{ id: number }[]>`
-        INSERT INTO conversations (member_id, persona_id, space_id)
-        VALUES (${memberId}, ${persona.id}, ${spaceId})
-        RETURNING id`;
-      cid = c.id;
-    }
-    await sql`INSERT INTO messages (conversation_id, role, content, model_used)
-              VALUES (${cid}, 'user', ${message}, ${null})`;
-    await sql`INSERT INTO messages (conversation_id, role, content, model_used)
-              VALUES (${cid}, 'assistant', ${reply}, ${modelUsed})`;
-    return cid;
+  const modelLabel = `${settings.provider}:${settings.model}`;
+
+  // 5) Stream the reply as SSE: recall first (so the panel lights up), then text
+  //    deltas, then a final `done` once the turn is persisted.
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = (event: string, data: unknown) => controller.enqueue(sse(event, data));
+      try {
+        send("recall", { used, savedMemory });
+
+        let reply = "";
+        for await (const delta of streamChat({
+          provider: settings.provider,
+          model: settings.model,
+          baseUrl: settings.base_url,
+          apiKey: keyForProvider(settings.provider),
+          system,
+          messages,
+        })) {
+          reply += delta;
+          send("delta", { text: delta });
+        }
+        if (!reply) reply = "(no response)";
+
+        // 6) Persist the conversation + messages.
+        const conversationId = await tx(async (sql) => {
+          let cid = existingConversationId;
+          if (!cid) {
+            const [c] = await sql<{ id: number }[]>`
+              INSERT INTO conversations (member_id, persona_id, space_id)
+              VALUES (${memberId}, ${persona.id}, ${spaceId})
+              RETURNING id`;
+            cid = c.id;
+          }
+          await sql`INSERT INTO messages (conversation_id, role, content, model_used)
+                    VALUES (${cid}, 'user', ${message}, ${null})`;
+          await sql`INSERT INTO messages (conversation_id, role, content, model_used)
+                    VALUES (${cid}, 'assistant', ${reply}, ${modelLabel})`;
+          return cid;
+        });
+
+        send("done", { conversationId, model: modelLabel });
+      } catch (e) {
+        const err = e as ProviderError;
+        send("error", {
+          message: err?.message ?? "Model call failed",
+          status: err?.status ?? 500,
+          provider: settings.provider,
+        });
+      } finally {
+        controller.close();
+      }
+    },
   });
 
-  return NextResponse.json({
-    reply,
-    model: `${settings.provider}:${settings.model}`,
-    used, // memories used for recall — surfaced in the UI
-    savedMemory, // non-null when a "remember that ..." note was stored
-    conversationId,
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+    },
   });
 }

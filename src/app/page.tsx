@@ -4,8 +4,16 @@ import { useCallback, useEffect, useState } from "react";
 import TopBar from "@/components/TopBar";
 import Chat from "@/components/Chat";
 import MemoryPanel from "@/components/MemoryPanel";
+import ConversationList from "@/components/ConversationList";
 import { api, setClientMember } from "@/lib/client";
-import type { Member, Memory, Persona, Settings, SpaceScope } from "@/lib/types";
+import type {
+  ConversationListItem,
+  Member,
+  Memory,
+  Persona,
+  Settings,
+  SpaceScope,
+} from "@/lib/types";
 
 const MEMBER_KEY = "familybrain.memberId";
 
@@ -18,6 +26,8 @@ export default function Home() {
   const [scope, setScope] = useState<SpaceScope>("family");
   const [memories, setMemories] = useState<Memory[]>([]);
   const [highlightedIds, setHighlightedIds] = useState<Set<number>>(new Set());
+  const [conversations, setConversations] = useState<ConversationListItem[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState<number | null>(null);
   const [loaded, setLoaded] = useState(false);
 
   // initial load
@@ -47,15 +57,43 @@ export default function Home() {
     setMemories(list);
   }, [memberId, scope]);
 
+  const refreshConversations = useCallback(async () => {
+    if (!memberId) return;
+    setConversations(await api<ConversationListItem[]>("/api/conversations"));
+  }, [memberId]);
+
   useEffect(() => {
     if (loaded) refreshMemories();
   }, [loaded, refreshMemories]);
+
+  useEffect(() => {
+    if (loaded) refreshConversations();
+  }, [loaded, refreshConversations]);
 
   function onMemberChange(id: number) {
     setMemberId(id);
     setClientMember(id);
     localStorage.setItem(MEMBER_KEY, String(id));
     setHighlightedIds(new Set());
+    setActiveConversationId(null); // a different member is a different context
+  }
+
+  function newChat() {
+    setActiveConversationId(null);
+    setHighlightedIds(new Set());
+  }
+
+  function selectConversation(item: ConversationListItem) {
+    // Show the conversation in its original space + persona for continuity.
+    if (item.space_type) setScope(item.space_type);
+    if (item.persona_id) setPersonaId(item.persona_id);
+    setActiveConversationId(item.id);
+    setHighlightedIds(new Set());
+  }
+
+  function onConversationStarted(id: number) {
+    setActiveConversationId(id);
+    refreshConversations();
   }
 
   const currentMember = members.find((m) => m.id === memberId) ?? null;
@@ -81,15 +119,24 @@ export default function Home() {
         onScopeChange={(s) => {
           setScope(s);
           setHighlightedIds(new Set());
+          newChat();
         }}
       />
       <div className="flex min-h-0 flex-1">
+        <ConversationList
+          conversations={conversations}
+          activeId={activeConversationId}
+          onSelect={selectConversation}
+          onNew={newChat}
+        />
         <Chat
           member={currentMember}
           persona={currentPersona}
           scope={scope}
+          conversationId={activeConversationId}
           onRecall={(ids) => setHighlightedIds(new Set(ids))}
           onMemorySaved={refreshMemories}
+          onConversationStarted={onConversationStarted}
         />
         <MemoryPanel
           memories={memories}

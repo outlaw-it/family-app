@@ -89,19 +89,53 @@ export class ProviderError extends Error {
   }
 }
 
-export async function chat(req: ChatRequest): Promise<string> {
+/**
+ * Stream a model reply as plain text deltas. The chat route turns these into SSE
+ * events for the browser. Every provider yields text chunks through this one door.
+ */
+export async function* streamChat(req: ChatRequest): AsyncGenerator<string> {
   switch (req.provider) {
     case "local":
     case "openai":
     case "azure":
       // All three speak the OpenAI /chat/completions shape. Azure differs only in
-      // its auth header + api-version, handled inside openAiCompatibleChat.
-      return openAiCompatibleChat(req);
+      // its auth header + api-version, handled inside streamOpenAiCompatible.
+      yield* streamOpenAiCompatible(req);
+      return;
     case "anthropic":
-      return anthropicChat(req);
+      yield* streamAnthropic(req);
+      return;
     default:
       throw new ProviderError(`Unknown provider: ${req.provider}`, 400);
   }
+}
+
+/** Non-streaming convenience: collect a streamed reply into a single string. */
+export async function chat(req: ChatRequest): Promise<string> {
+  let out = "";
+  for await (const delta of streamChat(req)) out += delta;
+  return out || "(no response)";
+}
+
+// Read an SSE response body line by line, tolerating chunk boundaries that split
+// a line. Used to parse both the OpenAI and Anthropic streaming wire formats.
+async function* sseLines(res: Response): AsyncGenerator<string> {
+  const reader = res.body?.getReader();
+  if (!reader) return;
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl: number;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      yield buf.slice(0, nl).replace(/\r$/, "");
+      buf = buf.slice(nl + 1);
+    }
+  }
+  const last = buf.replace(/\r$/, "");
+  if (last) yield last;
 }
 
 // Azure authenticates an API key via the `api-key` header (Bearer is for Entra ID
@@ -180,8 +214,8 @@ function normalizeOpenAiBase(url: string): string {
   return u;
 }
 
-// --- OpenAI-compatible (covers OpenAI cloud + Ollama + LM Studio + Azure OpenAI) ---
-async function openAiCompatibleChat(req: ChatRequest): Promise<string> {
+// --- OpenAI-compatible streaming (OpenAI cloud + Ollama + LM Studio + Azure) ---
+async function* streamOpenAiCompatible(req: ChatRequest): AsyncGenerator<string> {
   const rawBase =
     req.baseUrl?.trim() ||
     (req.provider === "openai" ? "https://api.openai.com/v1" : "http://localhost:11434/v1");
@@ -191,16 +225,11 @@ async function openAiCompatibleChat(req: ChatRequest): Promise<string> {
     throw new ProviderError("Missing AZURE_OPENAI_API_KEY in .env. Add it and restart the app.", 400);
   }
 
-  const messages = [
-    { role: "system", content: req.system },
-    ...req.messages,
-  ];
-
+  const messages = [{ role: "system", content: req.system }, ...req.messages];
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...authHeaders(req.provider, req.apiKey),
   };
-
   const endpoint = withApiVersion(req.provider, `${baseUrl}/chat/completions`);
 
   const post = (includeTemperature: boolean) =>
@@ -210,6 +239,7 @@ async function openAiCompatibleChat(req: ChatRequest): Promise<string> {
       body: JSON.stringify({
         model: req.model,
         messages,
+        stream: true,
         ...(includeTemperature ? { temperature: 0.4 } : {}),
       }),
     });
@@ -240,21 +270,29 @@ async function openAiCompatibleChat(req: ChatRequest): Promise<string> {
       }
       if (!res.ok) text = await res.text().catch(() => "");
     }
-
     if (!res.ok) {
-      throw new ProviderError(
-        `Model API error (${res.status}): ${text.slice(0, 400)}`,
-        res.status
-      );
+      throw new ProviderError(`Model API error (${res.status}): ${text.slice(0, 400)}`, res.status);
     }
   }
 
-  const data = (await res.json()) as any;
-  return data?.choices?.[0]?.message?.content ?? "(no response)";
+  for await (const line of sseLines(res)) {
+    if (!line.startsWith("data:")) continue;
+    const data = line.slice(5).trim();
+    if (data === "[DONE]") return;
+    if (!data) continue;
+    let json: any;
+    try {
+      json = JSON.parse(data);
+    } catch {
+      continue;
+    }
+    const delta = json?.choices?.[0]?.delta?.content;
+    if (typeof delta === "string" && delta) yield delta;
+  }
 }
 
-// --- Anthropic Claude -------------------------------------------------------
-async function anthropicChat(req: ChatRequest): Promise<string> {
+// --- Anthropic Claude streaming ---------------------------------------------
+async function* streamAnthropic(req: ChatRequest): AsyncGenerator<string> {
   if (!req.apiKey) {
     throw new ProviderError(
       "Missing ANTHROPIC_API_KEY. Add it to your .env file and restart the app.",
@@ -273,9 +311,10 @@ async function anthropicChat(req: ChatRequest): Promise<string> {
       },
       body: JSON.stringify({
         model: req.model,
-        max_tokens: 1024,
+        max_tokens: 2048,
         system: req.system,
         messages: req.messages,
+        stream: true,
       }),
     });
   } catch (e: any) {
@@ -284,13 +323,25 @@ async function anthropicChat(req: ChatRequest): Promise<string> {
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new ProviderError(
-      `Anthropic API error (${res.status}): ${text.slice(0, 400)}`,
-      res.status
-    );
+    throw new ProviderError(`Anthropic API error (${res.status}): ${text.slice(0, 400)}`, res.status);
   }
 
-  const data = (await res.json()) as any;
-  const parts = (data?.content ?? []) as Array<{ type: string; text?: string }>;
-  return parts.filter((p) => p.type === "text").map((p) => p.text).join("") || "(no response)";
+  // Anthropic streams typed SSE events; we only need the incremental text deltas.
+  for await (const line of sseLines(res)) {
+    if (!line.startsWith("data:")) continue;
+    const data = line.slice(5).trim();
+    if (!data) continue;
+    let json: any;
+    try {
+      json = JSON.parse(data);
+    } catch {
+      continue;
+    }
+    if (json?.type === "content_block_delta" && json?.delta?.type === "text_delta") {
+      const t = json.delta.text;
+      if (typeof t === "string" && t) yield t;
+    } else if (json?.type === "error") {
+      throw new ProviderError(`Anthropic stream error: ${json?.error?.message ?? "unknown"}`, 502);
+    }
+  }
 }

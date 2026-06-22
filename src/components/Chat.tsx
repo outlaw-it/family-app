@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { api } from "@/lib/client";
-import type { Member, Memory, Persona, SpaceScope } from "@/lib/types";
+import { api, getClientMember } from "@/lib/client";
+import type { ConversationMessage, Member, Memory, Persona, SpaceScope } from "@/lib/types";
 
 interface ChatTurn {
   role: "user" | "assistant";
@@ -16,70 +16,165 @@ interface Props {
   member: Member | null;
   persona: Persona | null;
   scope: SpaceScope;
+  // which conversation to show — null means a fresh chat
+  conversationId: number | null;
   // called with the ids of memories the assistant used, so the side panel can highlight them
   onRecall: (usedIds: number[]) => void;
   // called when chat saves a memory ("remember that ...") so the panel refreshes
   onMemorySaved: () => void;
+  // called once, when sending in a fresh chat creates a new conversation
+  onConversationStarted: (id: number) => void;
 }
 
-export default function Chat({ member, persona, scope, onRecall, onMemorySaved }: Props) {
+// Parse one SSE frame ("event: x\ndata: {...}") into its event name + JSON payload.
+function parseEvent(chunk: string): { event: string; data: any } | null {
+  let event = "message";
+  let data = "";
+  for (const line of chunk.split("\n")) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) data += line.slice(5).trim();
+  }
+  if (!data) return null;
+  try {
+    return { event, data: JSON.parse(data) };
+  } catch {
+    return null;
+  }
+}
+
+export default function Chat({
+  member,
+  persona,
+  scope,
+  conversationId,
+  onRecall,
+  onMemorySaved,
+  onConversationStarted,
+}: Props) {
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
-  const [conversationId, setConversationId] = useState<number | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
+  // the conversation whose turns are currently in state — avoids reloading the
+  // one we just created by sending.
+  const loadedRef = useRef<number | null>(null);
 
-  // Reset the conversation when who/where changes — a new context, a new chat.
+  // Load (or clear) turns whenever the selected conversation changes.
   useEffect(() => {
-    setTurns([]);
-    setConversationId(null);
-    onRecall([]);
+    let cancelled = false;
+    (async () => {
+      if (conversationId == null) {
+        setTurns([]);
+        loadedRef.current = null;
+        onRecall([]);
+        return;
+      }
+      if (loadedRef.current === conversationId) return; // already showing it
+      try {
+        const conv = await api<{ messages: ConversationMessage[] }>(
+          `/api/conversations/${conversationId}`
+        );
+        if (cancelled) return;
+        setTurns(
+          conv.messages
+            .filter((m) => m.role !== "system")
+            .map((m) => ({
+              role: m.role as "user" | "assistant",
+              content: m.content,
+              model: m.model_used ?? undefined,
+            }))
+        );
+        loadedRef.current = conversationId;
+        onRecall([]);
+      } catch {
+        if (!cancelled) setTurns([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [member?.id, scope]);
+  }, [conversationId]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [turns, busy]);
 
+  // Patch the most recent assistant turn (the one currently streaming in).
+  function patchLastAssistant(patch: Partial<ChatTurn>) {
+    setTurns((t) => {
+      const copy = [...t];
+      for (let i = copy.length - 1; i >= 0; i--) {
+        if (copy[i].role === "assistant") {
+          copy[i] = { ...copy[i], ...patch };
+          break;
+        }
+      }
+      return copy;
+    });
+  }
+
   async function send(e: React.FormEvent) {
     e.preventDefault();
     const message = input.trim();
-    if (!message || !persona) return;
+    if (!message || !persona || busy) return;
 
     const history = turns.map((t) => ({ role: t.role, content: t.content }));
-    setTurns((t) => [...t, { role: "user", content: message }]);
+    // append the user turn + an empty assistant turn to stream into
+    setTurns((t) => [...t, { role: "user", content: message }, { role: "assistant", content: "" }]);
     setInput("");
     setBusy(true);
 
+    let assistant = "";
     try {
-      const res = await api<{
-        reply: string;
-        model: string;
-        used: Memory[];
-        savedMemory: Memory | null;
-        conversationId: number;
-      }>("/api/chat", {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      const mid = getClientMember();
+      if (mid) headers["x-member-id"] = String(mid);
+
+      const res = await fetch("/api/chat", {
         method: "POST",
+        headers,
         body: JSON.stringify({ message, personaId: persona.id, scope, history, conversationId }),
       });
-      setConversationId(res.conversationId);
-      setTurns((t) => [
-        ...t,
-        {
-          role: "assistant",
-          content: res.reply,
-          used: res.used,
-          savedMemory: res.savedMemory,
-          model: res.model,
-        },
-      ]);
-      onRecall((res.used ?? []).map((m) => m.id));
-      if (res.savedMemory) onMemorySaved();
+      if (!res.ok || !res.body) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data?.error || `Request failed (${res.status})`);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let sep: number;
+        while ((sep = buf.indexOf("\n\n")) >= 0) {
+          const ev = parseEvent(buf.slice(0, sep));
+          buf = buf.slice(sep + 2);
+          if (!ev) continue;
+          if (ev.event === "recall") {
+            patchLastAssistant({ used: ev.data.used, savedMemory: ev.data.savedMemory });
+            onRecall((ev.data.used ?? []).map((m: Memory) => m.id));
+            if (ev.data.savedMemory) onMemorySaved();
+          } else if (ev.event === "delta") {
+            assistant += ev.data.text;
+            patchLastAssistant({ content: assistant });
+          } else if (ev.event === "done") {
+            patchLastAssistant({ model: ev.data.model });
+            if (conversationId == null && ev.data.conversationId) {
+              loadedRef.current = ev.data.conversationId; // we already hold these turns
+              onConversationStarted(ev.data.conversationId);
+            }
+          } else if (ev.event === "error") {
+            throw new Error(ev.data.message || "Something went wrong.");
+          }
+        }
+      }
     } catch (err: any) {
-      setTurns((t) => [
-        ...t,
-        { role: "assistant", content: `⚠️ ${err.message ?? "Something went wrong."}` },
-      ]);
+      patchLastAssistant({
+        content: (assistant ? assistant + "\n\n" : "") + `⚠️ ${err.message ?? "Something went wrong."}`,
+      });
     } finally {
       setBusy(false);
     }
@@ -122,7 +217,11 @@ export default function Chat({ member, persona, scope, onRecall, onMemorySaved }
                   : "border border-slate-200 bg-white text-slate-800"
               }`}
             >
-              <p className="whitespace-pre-wrap">{t.content}</p>
+              {t.role === "assistant" && t.content === "" ? (
+                <p className="text-slate-400">thinking…</p>
+              ) : (
+                <p className="whitespace-pre-wrap">{t.content}</p>
+              )}
 
               {t.savedMemory && (
                 <div className="mt-2 rounded-lg bg-green-50 px-2.5 py-1.5 text-xs text-green-700">
@@ -145,20 +244,10 @@ export default function Chat({ member, persona, scope, onRecall, onMemorySaved }
                 </div>
               )}
 
-              {t.model && (
-                <p className="mt-1 text-[10px] text-slate-400">{t.model}</p>
-              )}
+              {t.model && <p className="mt-1 text-[10px] text-slate-400">{t.model}</p>}
             </div>
           </div>
         ))}
-
-        {busy && (
-          <div className="flex justify-start">
-            <div className="rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm text-slate-400 shadow-sm">
-              thinking…
-            </div>
-          </div>
-        )}
         <div ref={endRef} />
       </div>
 
